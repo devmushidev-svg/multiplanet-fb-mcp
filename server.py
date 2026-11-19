@@ -27,7 +27,7 @@ import time
 from datetime import datetime, timedelta
 from pathlib import Path
 from tempfile import TemporaryDirectory
-from typing import Annotated
+from typing import Annotated, Literal
 from zoneinfo import ZoneInfo
 
 import httpx
@@ -50,6 +50,13 @@ logging.getLogger("httpx").setLevel(logging.WARNING)  # no escribir el token en 
 
 PAGE_ID = os.environ.get("FB_PAGE_ID", "")
 PAGE_TOKEN = os.environ.get("FB_PAGE_TOKEN", "")
+# Páginas disponibles. "tocoa" es la principal; "floristeria" se activa al definir sus variables.
+PAGINAS: dict[str, tuple[str, str]] = {"tocoa": (PAGE_ID, PAGE_TOKEN)}
+if os.environ.get("FB_PAGE_ID_FLORISTERIA") and os.environ.get("FB_PAGE_TOKEN_FLORISTERIA"):
+    PAGINAS["floristeria"] = (os.environ["FB_PAGE_ID_FLORISTERIA"], os.environ["FB_PAGE_TOKEN_FLORISTERIA"])
+NOMBRES_PAGINA = {"tocoa": "Multiplanet Tocoa", "floristeria": "Multiplanet Floristería"}
+Pagina = Literal["tocoa", "floristeria"]
+TOKENS = [t for _, t in PAGINAS.values() if t]
 GRAPH_VERSION = os.environ.get("FB_GRAPH_VERSION", "v25.0")
 GRAPH_URL = os.environ.get("FB_GRAPH_URL", "https://graph.facebook.com")
 TZ = ZoneInfo(os.environ.get("ZONA_HORARIA", "America/Tegucigalpa"))
@@ -93,7 +100,13 @@ else:
 mcp = FastMCP(
     name="facebook-multiplanet",
     instructions=(
-        "Publica y programa posts en la página de Facebook de Multiplanet (Tocoa, Honduras). "
+        "Publica y programa posts en las páginas de Facebook de Multiplanet: 'tocoa' (Multiplanet "
+        "Tocoa, la principal y la que se usa por defecto) y 'floristeria' (Multiplanet Floristería). "
+        "Usá pagina='floristeria' cuando el usuario diga floristería, florería, flores o similar, o "
+        "cuando el contenido sea claramente floral (ramos, arreglos, flores, insumos de floristería); "
+        "si la elegiste por el contenido, decíselo al usuario. En cualquier otro caso usá 'tocoa'. "
+        "Publicá, programá o borrá SOLO cuando el usuario lo pida de forma explícita (ej. 'publicalo', "
+        "'subilo a Facebook'); generar o mostrar una imagen no es permiso para publicarla. "
         "Las fotos se suben a la bandeja desde la página web del servidor; usá listar_imagenes y "
         "ver_imagen para conocerlas antes de escribir el texto. Para imágenes adjuntas en el chat usá "
         "programar_post_con_imagenes o verificar_imagenes_chat y pasá el archivo adjunto mismo en "
@@ -185,13 +198,13 @@ def _registrar(evento: dict) -> None:
 
 
 async def _graph(metodo: str, ruta: str, data: dict | None = None, files: dict | None = None,
-                 params: dict | None = None) -> dict:
+                 params: dict | None = None, token: str | None = None) -> dict:
     """Llama a la Graph API y convierte los errores de Meta en mensajes claros."""
     if DRY_RUN:
-        falso = f"{PAGE_ID or '000'}_{int(time.time() * 1000)}"
+        falso = f"{ruta.split('/')[0] or '000'}_{int(time.time() * 1000)}"
         return {"id": falso, "dry_run": True, "data": []}
     url = f"{GRAPH_URL}/{GRAPH_VERSION}/{ruta.lstrip('/')}"
-    params = {**(params or {}), "access_token": PAGE_TOKEN}
+    params = {**(params or {}), "access_token": token or PAGE_TOKEN}
     try:
         async with httpx.AsyncClient(timeout=90) as cliente:
             r = await cliente.request(metodo, url, params=params, data=data, files=files)
@@ -204,7 +217,9 @@ async def _graph(metodo: str, ruta: str, data: dict | None = None, files: dict |
     if r.status_code >= 400 or "error" in cuerpo:
         err = cuerpo.get("error", {})
         msg = err.get("error_user_msg") or err.get("message") or str(cuerpo)[:300]
-        msg = str(msg).replace(PAGE_TOKEN, "[oculto]")
+        msg = str(msg)
+        for t in TOKENS:
+            msg = msg.replace(t, "[oculto]")
         codigo = err.get("code")
         pista = ""
         if codigo == 190:
@@ -217,16 +232,42 @@ async def _graph(metodo: str, ruta: str, data: dict | None = None, files: dict |
     return cuerpo
 
 
-async def _subir_fotos(nombres: list[str]) -> list[str]:
+def _pagina(pagina: str | None) -> tuple[str, str, str]:
+    """Devuelve (id, token, nombre visible) de la página pedida. Por defecto, Tocoa."""
+    clave = (pagina or "tocoa").strip().lower()
+    if clave not in NOMBRES_PAGINA:
+        raise ValueError("Página desconocida: usá 'tocoa' o 'floristeria'.")
+    if clave not in PAGINAS:
+        if DRY_RUN:
+            return ("480683145137621", "", NOMBRES_PAGINA[clave])
+        raise ValueError(f"{NOMBRES_PAGINA[clave]} todavía no está conectada en el servidor "
+                         "(faltan FB_PAGE_ID_FLORISTERIA y FB_PAGE_TOKEN_FLORISTERIA).")
+    pid, token = PAGINAS[clave]
+    return pid, token, NOMBRES_PAGINA[clave]
+
+
+def _pagina_de_post(post_id: str, pagina: str | None) -> tuple[str, str]:
+    """Deduce la página por el prefijo del ID del post ('<idpagina>_<idpost>')."""
+    prefijo = post_id.split("_", 1)[0]
+    for clave, (pid, _) in PAGINAS.items():
+        if pid and pid == prefijo:
+            _, token, nombre = _pagina(clave)
+            return token, nombre
+    _, token, nombre = _pagina(pagina)
+    return token, nombre
+
+
+async def _subir_fotos(nombres: list[str], page_id: str, token: str) -> list[str]:
     """Sube fotos como no publicadas/temporales y devuelve sus IDs para adjuntar al post."""
     ids = []
     for nombre in nombres:
         ruta = _ruta_bandeja(nombre)
         datos, mime = _preparar_imagen(ruta)
         res = await _graph(
-            "POST", f"{PAGE_ID}/photos",
+            "POST", f"{page_id}/photos",
             data={"published": "false", "temporary": "true"},
             files={"source": (ruta.name, datos, mime)},
+            token=token,
         )
         ids.append(res["id"])
     return ids
@@ -244,7 +285,8 @@ def _mover_a_usadas(nombres: list[str]) -> None:
 
 
 async def _crear_post(texto: str, imagenes: list[str], link: str | None,
-                      programado_ts: int | None) -> dict:
+                      programado_ts: int | None, pagina: str | None = None) -> dict:
+    page_id, token, nombre = _pagina(pagina)
     if not texto.strip() and not imagenes and not link:
         raise ValueError("El post necesita al menos texto, una imagen o un link.")
     if imagenes and link:
@@ -260,15 +302,17 @@ async def _crear_post(texto: str, imagenes: list[str], link: str | None,
     if link:
         data["link"] = link
     if imagenes:
-        for i, fbid in enumerate(await _subir_fotos(imagenes)):
+        for i, fbid in enumerate(await _subir_fotos(imagenes, page_id, token)):
             data[f"attached_media[{i}]"] = json.dumps({"media_fbid": fbid})
     if programado_ts is not None:
         data["published"] = "false"
         data["scheduled_publish_time"] = str(programado_ts)
 
-    res = await _graph("POST", f"{PAGE_ID}/feed", data=data)
+    res = await _graph("POST", f"{page_id}/feed", data=data, token=token)
+    res["pagina"] = nombre
     _mover_a_usadas(imagenes)
     _registrar({"accion": "programado" if programado_ts else "publicado", "post_id": res.get("id"),
+                "pagina": nombre,
                 "hora": _fmt_ts(programado_ts) if programado_ts else "ahora",
                 "imagenes": imagenes, "texto": texto[:200]})
     return res
@@ -430,6 +474,15 @@ EntradaArchivosChat = ArchivosChat | SkipJsonSchema[str | ArchivosChatConMarcado
 _archivos_chat_en_curso = asyncio.Lock()
 
 
+def _resultado(res: dict, dt: datetime | None) -> str:
+    extra = " (simulado)" if res.get("dry_run") else ""
+    donde = f" en {res.get('pagina', NOMBRES_PAGINA['tocoa'])}"
+    if dt is None:
+        return f"Publicado{extra}{donde}. ID: {res.get('id')}"
+    return (f"Programado{extra}{donde} para {dt.astimezone(TZ):%Y-%m-%d %H:%M} (hora Honduras). "
+            f"ID: {res.get('id')}")
+
+
 @mcp.tool(
     meta=META_ARCHIVOS_CHAT,
     annotations=ToolAnnotations(readOnlyHint=True, destructiveHint=False, openWorldHint=True),
@@ -455,15 +508,17 @@ async def verificar_imagenes_chat(imagenes: EntradaArchivosChat) -> str:
     ),
 )
 async def programar_post_con_imagenes(
-    texto: str, imagenes: EntradaArchivosChat, fecha: str | None = None,
+    texto: str, imagenes: EntradaArchivosChat, fecha: str | None = None, pagina: Pagina = "tocoa",
 ) -> str:
     """Publica o programa un post con entre 1 y 10 imágenes adjuntas del chat.
-    Usá esta herramienta solo cuando el usuario autorice publicar o programar.
+    Usala SOLO cuando el usuario pida publicar o programar de forma explícita.
+    pagina: 'tocoa' (por defecto) o 'floristeria' (si lo pide o el contenido es floral).
     Si omitís fecha, publica de inmediato. Sin zona horaria se usa la de Honduras.
     Para comprobar las imágenes sin publicar, usá verificar_imagenes_chat.
     """
     dt = _parse_fecha(fecha) if fecha is not None else None
     ts = _validar_programacion(dt) if dt is not None else None
+    _pagina(pagina)  # falla antes de descargar si la página no está conectada
     async with _archivos_chat_en_curso:
         with TemporaryDirectory(prefix=".chat-", dir=DATA_DIR) as carpeta:
             recibidas = await _recibir_archivos_chat(imagenes, Path(carpeta))
@@ -478,12 +533,8 @@ async def programar_post_con_imagenes(
                 for nombre in nombres:
                     (BANDEJA / nombre).unlink(missing_ok=True)
                 raise
-        res = await _crear_post(texto, nombres, None, ts)
-
-    extra = " (simulado)" if res.get("dry_run") else ""
-    if dt is None:
-        return f"Publicado{extra}. ID: {res.get('id')}"
-    return f"Programado{extra} para {dt.astimezone(TZ):%Y-%m-%d %H:%M} (hora Honduras). ID: {res.get('id')}"
+        res = await _crear_post(texto, nombres, None, ts, pagina)
+    return _resultado(res, dt)
 
 
 EntradaArchivoChat = ArchivoChat | SkipJsonSchema[str]
@@ -506,12 +557,14 @@ async def verificar_imagen_chat(imagen: EntradaArchivoChat) -> str:
         readOnlyHint=False, destructiveHint=False, idempotentHint=False, openWorldHint=True,
     ),
 )
-async def publicar_imagen_chat(texto: str, imagen: EntradaArchivoChat, fecha: str | None = None) -> str:
-    """Publica o programa un post con UNA imagen adjunta en el chat. Usala solo si el usuario
-    autoriza publicar. Sin fecha publica ya; con fecha ('AAAA-MM-DD HH:MM', hora de Honduras) programa.
+async def publicar_imagen_chat(texto: str, imagen: EntradaArchivoChat, fecha: str | None = None,
+                               pagina: Pagina = "tocoa") -> str:
+    """Publica o programa un post con UNA imagen adjunta en el chat. Usala SOLO si el usuario pide
+    publicar de forma explícita. Sin fecha publica ya; con fecha ('AAAA-MM-DD HH:MM', hora de
+    Honduras) programa. pagina: 'tocoa' (por defecto) o 'floristeria' (si lo pide o es floral).
     Pasá el archivo adjunto mismo en 'imagen'; nunca rutas /mnt/data ni sandbox:.
     """
-    return await programar_post_con_imagenes(texto, [imagen], fecha)
+    return await programar_post_con_imagenes(texto, [imagen], fecha, pagina)
 
 
 # ChatGPT solo convierte un adjunto en {download_url, file_id} si el esquema anunciado coincide
@@ -536,6 +589,12 @@ _IMAGENES = {
     "maxItems": 10,
     "description": "Las imágenes adjuntas en el chat (el archivo mismo). Nunca escribas rutas /mnt/data ni sandbox:.",
 }
+_PAGINA = {
+    "type": "string",
+    "enum": ["tocoa", "floristeria"],
+    "description": "Opcional. 'floristeria' si el usuario lo pide (floristería, florería, flores) o el "
+                   "contenido es floral (ramos, arreglos, insumos); si se omite, Multiplanet Tocoa.",
+}
 
 
 def _anunciar_esquema(nombre: str, propiedades: dict, requeridos: list[str]) -> None:
@@ -558,6 +617,7 @@ _anunciar_esquema(
             "type": "string",
             "description": "Opcional. 'AAAA-MM-DD HH:MM' en hora de Honduras. Si se omite, publica ya.",
         },
+        "pagina": _PAGINA,
     },
     ["texto", "imagenes"],
 )
@@ -572,6 +632,7 @@ _anunciar_esquema(
             "type": "string",
             "description": "Opcional. 'AAAA-MM-DD HH:MM' en hora de Honduras. Si se omite, publica ya.",
         },
+        "pagina": _PAGINA,
     },
     ["texto", "imagen"],
 )
@@ -579,11 +640,13 @@ _anunciar_esquema(
 
 
 @mcp.tool()
-async def info_pagina() -> str:
-    """Muestra nombre, seguidores y enlace de la página de Facebook conectada. Útil para verificar que el token funciona."""
+async def info_pagina(pagina: Pagina = "tocoa") -> str:
+    """Muestra nombre, seguidores y enlace de una página ('tocoa' o 'floristeria'). Útil para verificar el token."""
+    page_id, token, _ = _pagina(pagina)
     if DRY_RUN:
         return "Modo prueba (FB_DRY_RUN=1): no hay conexión real con Facebook."
-    p = await _graph("GET", PAGE_ID, params={"fields": "name,followers_count,fan_count,link,category"})
+    p = await _graph("GET", page_id, params={"fields": "name,followers_count,fan_count,link,category"},
+                     token=token)
     return (f"Página: {p.get('name')} ({p.get('category', '')})\n"
             f"Seguidores: {p.get('followers_count', p.get('fan_count', '?'))}\n"
             f"Enlace: {p.get('link', '')}")
@@ -622,8 +685,8 @@ def ver_imagen(nombre: str) -> Image:
 
 @mcp.tool()
 async def programar_post(texto: str, fecha: str, imagenes: list[str] | None = None,
-                         link: str | None = None) -> str:
-    """Programa un post en la página de Facebook.
+                         link: str | None = None, pagina: Pagina = "tocoa") -> str:
+    """Programa un post. Usala SOLO si el usuario pide programar de forma explícita.
 
     Args:
         texto: Texto completo del post (con emojis y hashtags si se quieren).
@@ -631,38 +694,40 @@ async def programar_post(texto: str, fecha: str, imagenes: list[str] | None = No
                Debe estar entre 10 minutos y 30 días en el futuro.
         imagenes: Nombres de fotos de la bandeja (ver listar_imagenes). Hasta 10. Opcional.
         link: URL para compartir con vista previa (no se combina con imágenes). Opcional.
+        pagina: 'tocoa' (por defecto) o 'floristeria' (si lo pide o el contenido es floral).
     """
     dt = _parse_fecha(fecha)
     ts = _validar_programacion(dt)
-    res = await _crear_post(texto, imagenes or [], link, ts)
-    extra = " (simulado)" if res.get("dry_run") else ""
-    return f"Programado{extra} para {dt.astimezone(TZ):%Y-%m-%d %H:%M} (hora Honduras). ID: {res.get('id')}"
+    res = await _crear_post(texto, imagenes or [], link, ts, pagina)
+    return _resultado(res, dt)
 
 
 @mcp.tool()
-async def publicar_ahora(texto: str, imagenes: list[str] | None = None, link: str | None = None) -> str:
-    """Publica un post en la página de Facebook de inmediato.
+async def publicar_ahora(texto: str, imagenes: list[str] | None = None, link: str | None = None,
+                         pagina: Pagina = "tocoa") -> str:
+    """Publica un post de inmediato. Usala SOLO si el usuario pide publicar de forma explícita.
 
     Args:
         texto: Texto del post.
         imagenes: Nombres de fotos de la bandeja. Opcional, hasta 10.
         link: URL para compartir (no se combina con imágenes). Opcional.
+        pagina: 'tocoa' (por defecto) o 'floristeria' (si lo pide o el contenido es floral).
     """
-    res = await _crear_post(texto, imagenes or [], link, None)
-    extra = " (simulado)" if res.get("dry_run") else ""
-    return f"Publicado{extra}. ID: {res.get('id')}"
+    res = await _crear_post(texto, imagenes or [], link, None, pagina)
+    return _resultado(res, None)
 
 
 @mcp.tool()
-async def listar_programados(limite: int = 50) -> str:
-    """Lista los posts programados (pendientes) de la página, ordenados por hora de publicación."""
-    res = await _graph("GET", f"{PAGE_ID}/scheduled_posts", params={
+async def listar_programados(limite: int = 50, pagina: Pagina = "tocoa") -> str:
+    """Lista los posts programados (pendientes) de una página ('tocoa' o 'floristeria'), por hora."""
+    page_id, token, nombre = _pagina(pagina)
+    res = await _graph("GET", f"{page_id}/scheduled_posts", params={
         "fields": "id,message,scheduled_publish_time,full_picture", "limit": str(min(limite, 100)),
-    })
+    }, token=token)
     posts = sorted(res.get("data", []), key=lambda p: int(p.get("scheduled_publish_time") or 0))
     if not posts:
-        return "No hay posts programados."
-    lineas = [f"{len(posts)} post(s) programados:"]
+        return f"No hay posts programados en {nombre}."
+    lineas = [f"{len(posts)} post(s) programados en {nombre}:"]
     for p in posts:
         texto = (p.get("message") or "").replace("\n", " ")
         foto = " [foto]" if p.get("full_picture") else ""
@@ -671,13 +736,15 @@ async def listar_programados(limite: int = 50) -> str:
 
 
 @mcp.tool()
-async def reprogramar(post_id: str, fecha: str | None = None, texto: str | None = None) -> str:
+async def reprogramar(post_id: str, fecha: str | None = None, texto: str | None = None,
+                      pagina: Pagina | None = None) -> str:
     """Cambia la hora y/o el texto de un post que todavía está programado.
 
     Args:
         post_id: ID del post (de listar_programados).
         fecha: Nueva fecha y hora, ej. "2026-11-21 18:00". Opcional.
         texto: Nuevo texto. Opcional.
+        pagina: Solo si el ID no indica la página. Normalmente se deduce sola.
     """
     if not fecha and texto is None:
         raise ValueError("Indicá una nueva fecha, un nuevo texto o ambos.")
@@ -686,36 +753,41 @@ async def reprogramar(post_id: str, fecha: str | None = None, texto: str | None 
         data["scheduled_publish_time"] = str(_validar_programacion(_parse_fecha(fecha)))
     if texto is not None:
         data["message"] = texto
-    await _graph("POST", post_id, data=data)
-    _registrar({"accion": "reprogramado", "post_id": post_id, **{k: v[:200] for k, v in data.items()}})
-    return f"Post {post_id} actualizado."
+    token, nombre = _pagina_de_post(post_id, pagina)
+    await _graph("POST", post_id, data=data, token=token)
+    _registrar({"accion": "reprogramado", "post_id": post_id, "pagina": nombre,
+                **{k: v[:200] for k, v in data.items()}})
+    return f"Post {post_id} de {nombre} actualizado."
 
 
 @mcp.tool()
-async def publicar_programado_ya(post_id: str) -> str:
-    """Publica inmediatamente un post que estaba programado para más tarde."""
-    await _graph("POST", post_id, data={"is_published": "true"})
-    _registrar({"accion": "adelantado", "post_id": post_id})
-    return f"Post {post_id} publicado ahora."
+async def publicar_programado_ya(post_id: str, pagina: Pagina | None = None) -> str:
+    """Publica inmediatamente un post que estaba programado. Solo si el usuario lo pide."""
+    token, nombre = _pagina_de_post(post_id, pagina)
+    await _graph("POST", post_id, data={"is_published": "true"}, token=token)
+    _registrar({"accion": "adelantado", "post_id": post_id, "pagina": nombre})
+    return f"Post {post_id} publicado ahora en {nombre}."
 
 
 @mcp.tool()
-async def borrar_post(post_id: str) -> str:
+async def borrar_post(post_id: str, pagina: Pagina | None = None) -> str:
     """Borra un post (programado o publicado). Es irreversible: confirmá con el usuario antes."""
-    await _graph("DELETE", post_id)
-    _registrar({"accion": "borrado", "post_id": post_id})
-    return f"Post {post_id} borrado."
+    token, nombre = _pagina_de_post(post_id, pagina)
+    await _graph("DELETE", post_id, token=token)
+    _registrar({"accion": "borrado", "post_id": post_id, "pagina": nombre})
+    return f"Post {post_id} de {nombre} borrado."
 
 
 @mcp.tool()
-async def posts_recientes(limite: int = 10) -> str:
-    """Lista los últimos posts publicados en la página (para no repetir textos o productos)."""
-    res = await _graph("GET", f"{PAGE_ID}/posts", params={
+async def posts_recientes(limite: int = 10, pagina: Pagina = "tocoa") -> str:
+    """Lista los últimos posts de una página ('tocoa' o 'floristeria') para no repetir contenido."""
+    page_id, token, nombre = _pagina(pagina)
+    res = await _graph("GET", f"{page_id}/posts", params={
         "fields": "id,message,created_time,permalink_url", "limit": str(min(limite, 50)),
-    })
+    }, token=token)
     posts = res.get("data", [])
     if not posts:
-        return "No hay posts recientes."
+        return f"No hay posts recientes en {nombre}."
     lineas = []
     for p in posts:
         creado = p.get("created_time", "")[:16].replace("T", " ")

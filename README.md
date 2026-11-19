@@ -6,6 +6,8 @@ oficial de Meta: sin límite de posts al mes y sin pagar herramientas de tercero
 
 ## Herramientas
 
+Dos páginas: `tocoa` (por defecto) y `floristeria`. Las herramientas de publicar y listar aceptan `pagina`; el modelo elige `floristeria` si el usuario lo pide o el contenido es floral. Reprogramar/borrar deducen la página por el ID del post. Solo publica cuando el usuario lo pide de forma explícita.
+
 | Herramienta | Para qué |
 |---|---|
 | `programar_post_con_imagenes` | Publica o programa un post con 1–10 imágenes **adjuntas en el chat de ChatGPT** (`openai/fileParams`). Sin `fecha` publica ya |
@@ -26,7 +28,7 @@ pueden programar por la API.
 - VM de Azure `vcbot` (grupo `VCBOT-RG`, Ubuntu 24.04), junto al bot de Discord.
 - Código en `/opt/fbmcp`, servicio systemd `fbmcp`, Caddy hace HTTPS y proxy a `127.0.0.1:8000`.
 - Configuración en `/opt/fbmcp/.env` (**nunca** en el repo): `MCP_SECRET`, `FB_PAGE_ID`,
-  `FB_PAGE_TOKEN`, `FB_GRAPH_VERSION`, `PUBLIC_HOST`, `HOST`, `PORT`, `DATA_DIR`, `ZONA_HORARIA`.
+  `FB_PAGE_TOKEN`, `FB_PAGE_ID_FLORISTERIA`, `FB_PAGE_TOKEN_FLORISTERIA` (opcionales), `FB_GRAPH_VERSION`, `PUBLIC_HOST`, `HOST`, `PORT`, `DATA_DIR`, `ZONA_HORARIA`.
 
 ### Actualizar la VM después de un push
 
