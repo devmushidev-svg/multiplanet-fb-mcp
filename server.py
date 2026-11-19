@@ -95,8 +95,9 @@ mcp = FastMCP(
     instructions=(
         "Publica y programa posts en la página de Facebook de Multiplanet (Tocoa, Honduras). "
         "Las fotos se suben a la bandeja desde la página web del servidor; usá listar_imagenes y "
-        "ver_imagen para conocerlas antes de escribir el texto. Para archivos del chat usá "
-        "programar_post_con_imagenes o verificar_imagenes_chat. Las fechas se interpretan en hora "
+        "ver_imagen para conocerlas antes de escribir el texto. Para imágenes adjuntas en el chat usá "
+        "programar_post_con_imagenes o verificar_imagenes_chat y pasá el archivo adjunto mismo en "
+        "'imagenes'; nunca escribas rutas /mnt/data ni sandbox:. Las fechas se interpretan en hora "
         "de Honduras si no traen zona horaria. Meta solo permite programar entre 10 minutos y 30 "
         "días adelante. Antes de programar una tanda, mostrale al usuario los textos y horarios."
     ),
@@ -300,9 +301,23 @@ MAX_BYTES_CHAT = 25 * 1024 * 1024
 MAX_PIXELES_CHAT = 12_000_000
 
 
+HOSTS_ARCHIVOS_CHAT = ("oaiusercontent.com", "openai.com", "chatgpt.com")
+
+
+def _host_permitido(host: str) -> bool:
+    return any(host == h or host.endswith("." + h) for h in HOSTS_ARCHIVOS_CHAT)
+
+
 def _url_archivo_chat(archivo: ArchivoChat) -> httpx.URL:
     if not archivo["download_url"].strip() or not archivo["file_id"].strip():
         raise ValueError(ERROR_ARCHIVO_CHAT)
+    crudo = archivo["download_url"].strip()
+    if crudo.startswith(("/mnt/", "sandbox:", "file:")):
+        raise ValueError(
+            "ChatGPT mandó la ruta interna del archivo (/mnt/data), no un enlace descargable. "
+            "Pasa con imágenes generadas por ChatGPT y en la app del celular: descargá la imagen, "
+            "adjuntala en el chat desde ChatGPT web y pedí publicar de nuevo."
+        )
     mime = archivo.get("mime_type", "").split(";", 1)[0].strip().lower()
     if mime and not mime.startswith("image/") and mime != "application/octet-stream":
         raise ValueError("Adjuntá un archivo de imagen.")
@@ -313,10 +328,10 @@ def _url_archivo_chat(archivo: ArchivoChat) -> httpx.URL:
     host = url.host.lower()
     if (
         url.scheme != "https" or url.port not in (None, 443) or url.userinfo
-        or not (host == "oaiusercontent.com" or host.endswith(".oaiusercontent.com"))
+        or not _host_permitido(host)
     ):
         raise ValueError(
-            "El enlace debe ser HTTPS y de oaiusercontent.com. "
+            "El enlace debe ser HTTPS y de un dominio de OpenAI (oaiusercontent.com, openai.com o chatgpt.com). "
             "Si ChatGPT no entrega un enlace compatible, usá la página /subir."
         )
     return url
@@ -442,6 +457,55 @@ async def programar_post_con_imagenes(
     if dt is None:
         return f"Publicado{extra}. ID: {res.get('id')}"
     return f"Programado{extra} para {dt.astimezone(TZ):%Y-%m-%d %H:%M} (hora Honduras). ID: {res.get('id')}"
+
+
+# ChatGPT solo convierte un adjunto en {download_url, file_id} si el esquema anunciado coincide
+# EXACTAMENTE con la plantilla del Apps SDK (objeto con additionalProperties: false, sin campos
+# extra). El esquema que genera pydantic agrega títulos y no pone additionalProperties, así que
+# se reemplaza el esquema anunciado; la validación real sigue usando los tipos de arriba.
+_OPENAI_FILE = {
+    "type": "object",
+    "properties": {
+        "download_url": {"type": "string"},
+        "file_id": {"type": "string"},
+        "mime_type": {"type": "string"},
+        "file_name": {"type": "string"},
+    },
+    "required": ["download_url", "file_id"],
+    "additionalProperties": False,
+}
+_IMAGENES = {
+    "type": "array",
+    "items": {"$ref": "#/$defs/OpenAIFile"},
+    "minItems": 1,
+    "maxItems": 10,
+    "description": "Las imágenes adjuntas en el chat (el archivo mismo). Nunca escribas rutas /mnt/data ni sandbox:.",
+}
+
+
+def _anunciar_esquema(nombre: str, propiedades: dict, requeridos: list[str]) -> None:
+    mcp._tool_manager._tools[nombre].parameters = {
+        "type": "object",
+        "properties": propiedades,
+        "required": requeridos,
+        "additionalProperties": False,
+        "$defs": {"OpenAIFile": _OPENAI_FILE},
+    }
+
+
+_anunciar_esquema("verificar_imagenes_chat", {"imagenes": _IMAGENES}, ["imagenes"])
+_anunciar_esquema(
+    "programar_post_con_imagenes",
+    {
+        "texto": {"type": "string", "description": "Texto completo del post."},
+        "imagenes": _IMAGENES,
+        "fecha": {
+            "type": "string",
+            "description": "Opcional. 'AAAA-MM-DD HH:MM' en hora de Honduras. Si se omite, publica ya.",
+        },
+    },
+    ["texto", "imagenes"],
+)
 
 
 
