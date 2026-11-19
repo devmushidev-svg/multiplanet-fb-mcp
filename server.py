@@ -304,8 +304,15 @@ MAX_PIXELES_CHAT = 12_000_000
 HOSTS_ARCHIVOS_CHAT = ("oaiusercontent.com", "openai.com", "chatgpt.com")
 
 
+# ChatGPT entrega los adjuntos con un enlace SAS al almacenamiento de OpenAI en Azure,
+# por ejemplo https://oaisdmntprcentralus.blob.core.windows.net/files/... (visto en producción).
+# Solo se aceptan cuentas de almacenamiento que empiezan con "oai", no cualquier blob de Azure.
+_BLOB_OPENAI = re.compile(r"^oai[a-z0-9]{1,21}\.blob\.core\.windows\.net$")
+
+
 def _host_permitido(host: str) -> bool:
-    return any(host == h or host.endswith("." + h) for h in HOSTS_ARCHIVOS_CHAT)
+    return (any(host == h or host.endswith("." + h) for h in HOSTS_ARCHIVOS_CHAT)
+            or bool(_BLOB_OPENAI.match(host)))
 
 
 def _url_archivo_chat(archivo: ArchivoChat) -> httpx.URL:
@@ -331,7 +338,7 @@ def _url_archivo_chat(archivo: ArchivoChat) -> httpx.URL:
         or not _host_permitido(host)
     ):
         raise ValueError(
-            "El enlace debe ser HTTPS y de un dominio de OpenAI (oaiusercontent.com, openai.com o chatgpt.com). "
+            "El enlace debe ser HTTPS y del almacenamiento de archivos de OpenAI. "
             "Si ChatGPT no entrega un enlace compatible, usá la página /subir."
         )
     return url
