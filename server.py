@@ -375,9 +375,29 @@ def _inspeccionar_archivo_chat(ruta: Path) -> tuple[str, int, int]:
     return extension, ancho, alto
 
 
+_log = logging.getLogger("fbmcp")
+
+
+def _describir_entrada(valor) -> str:
+    """Resumen seguro de lo que mandó ChatGPT: sin query string (puede llevar firma)."""
+    def url_corta(u) -> str:
+        return str(u).split("?", 1)[0][:80]
+    if isinstance(valor, str):
+        return f"str:{url_corta(valor)!r}"
+    if isinstance(valor, dict):
+        return "obj{" + ", ".join(
+            f"{k}={url_corta(v)!r}" if k == "download_url" else f"{k}={str(v)[:40]!r}"
+            for k, v in valor.items()
+        ) + "}"
+    if isinstance(valor, list):
+        return "[" + "; ".join(_describir_entrada(v) for v in valor) + "]"
+    return type(valor).__name__
+
+
 async def _recibir_archivos_chat(
     imagenes: ArchivosChat | str | list[ArchivoChat | str], temporal: Path,
 ) -> list[tuple[Path, int, int, int]]:
+    _log.warning("archivos del chat recibidos: %s", _describir_entrada(imagenes))
     if isinstance(imagenes, str) or any(isinstance(archivo, str) for archivo in imagenes):
         raise ValueError(ERROR_ARCHIVO_CHAT)
 
@@ -459,6 +479,34 @@ async def programar_post_con_imagenes(
     return f"Programado{extra} para {dt.astimezone(TZ):%Y-%m-%d %H:%M} (hora Honduras). ID: {res.get('id')}"
 
 
+EntradaArchivoChat = ArchivoChat | SkipJsonSchema[str]
+
+
+@mcp.tool(
+    meta={"openai/fileParams": ["imagen"]},
+    annotations=ToolAnnotations(readOnlyHint=True, destructiveHint=False, openWorldHint=True),
+)
+async def verificar_imagen_chat(imagen: EntradaArchivoChat) -> str:
+    """Comprueba UNA imagen adjunta en el chat (formato, tamaño, dimensiones). No publica nada.
+    Pasá el archivo adjunto mismo en 'imagen'; nunca rutas /mnt/data ni sandbox:.
+    """
+    return await verificar_imagenes_chat([imagen])
+
+
+@mcp.tool(
+    meta={"openai/fileParams": ["imagen"]},
+    annotations=ToolAnnotations(
+        readOnlyHint=False, destructiveHint=False, idempotentHint=False, openWorldHint=True,
+    ),
+)
+async def publicar_imagen_chat(texto: str, imagen: EntradaArchivoChat, fecha: str | None = None) -> str:
+    """Publica o programa un post con UNA imagen adjunta en el chat. Usala solo si el usuario
+    autoriza publicar. Sin fecha publica ya; con fecha ('AAAA-MM-DD HH:MM', hora de Honduras) programa.
+    Pasá el archivo adjunto mismo en 'imagen'; nunca rutas /mnt/data ni sandbox:.
+    """
+    return await programar_post_con_imagenes(texto, [imagen], fecha)
+
+
 # ChatGPT solo convierte un adjunto en {download_url, file_id} si el esquema anunciado coincide
 # EXACTAMENTE con la plantilla del Apps SDK (objeto con additionalProperties: false, sin campos
 # extra). El esquema que genera pydantic agrega títulos y no pone additionalProperties, así que
@@ -505,6 +553,20 @@ _anunciar_esquema(
         },
     },
     ["texto", "imagenes"],
+)
+_IMAGEN = {"$ref": "#/$defs/OpenAIFile"}  # idéntico al ejemplo de la documentación del Apps SDK
+_anunciar_esquema("verificar_imagen_chat", {"imagen": _IMAGEN}, ["imagen"])
+_anunciar_esquema(
+    "publicar_imagen_chat",
+    {
+        "texto": {"type": "string", "description": "Texto completo del post."},
+        "imagen": _IMAGEN,
+        "fecha": {
+            "type": "string",
+            "description": "Opcional. 'AAAA-MM-DD HH:MM' en hora de Honduras. Si se omite, publica ya.",
+        },
+    },
+    ["texto", "imagen"],
 )
 
 
