@@ -1,0 +1,686 @@
+"""
+MCP de Facebook para Multiplanet.
+
+Servidor MCP remoto (Streamable HTTP) que publica y programa posts en una
+página de Facebook usando la Graph API oficial de Meta.
+
+Flujo pensado:
+  1. Subís las fotos desde el celular o la compu a la página /subir/<SECRETO>.
+  2. Desde Claude: "mirá las imágenes nuevas y programame 5 posts diarios".
+  3. Claude ve cada foto (ver_imagen), escribe el texto y llama programar_post.
+  4. Meta publica a la hora indicada; el servidor no necesita estar despierto
+     en ese momento.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import html
+import io
+import json
+import logging
+import os
+import re
+import secrets
+import shutil
+import time
+from datetime import datetime, timedelta
+from pathlib import Path
+from tempfile import TemporaryDirectory
+from typing import Annotated
+from zoneinfo import ZoneInfo
+
+import httpx
+from mcp.server.fastmcp import FastMCP, Image
+from mcp.server.transport_security import TransportSecuritySettings
+from mcp.types import ToolAnnotations
+from pydantic import Field
+from pydantic.json_schema import SkipJsonSchema
+from typing_extensions import NotRequired, TypedDict
+from PIL import Image as PILImage
+from PIL import ImageOps
+from starlette.requests import Request
+from starlette.responses import HTMLResponse, JSONResponse, RedirectResponse
+
+logging.getLogger("httpx").setLevel(logging.WARNING)  # no escribir el token en los logs
+
+# ---------------------------------------------------------------------------
+# Configuración (todo por variables de entorno)
+# ---------------------------------------------------------------------------
+
+PAGE_ID = os.environ.get("FB_PAGE_ID", "")
+PAGE_TOKEN = os.environ.get("FB_PAGE_TOKEN", "")
+GRAPH_VERSION = os.environ.get("FB_GRAPH_VERSION", "v25.0")
+GRAPH_URL = os.environ.get("FB_GRAPH_URL", "https://graph.facebook.com")
+TZ = ZoneInfo(os.environ.get("ZONA_HORARIA", "America/Tegucigalpa"))
+SECRET = os.environ.get("MCP_SECRET", "")
+DATA_DIR = Path(os.environ.get("DATA_DIR", "./data"))
+PUBLIC_HOST = os.environ.get("PUBLIC_HOST", "")  # ej. multiplanet-mcp.eastus.cloudapp.azure.com
+DRY_RUN = os.environ.get("FB_DRY_RUN", "0") == "1"  # no llama a Meta, solo simula
+PORT = int(os.environ.get("PORT", "8000"))
+
+# Límites de Meta para scheduled_publish_time
+MIN_ANTICIPACION = timedelta(minutes=10)
+MAX_ANTICIPACION = timedelta(days=int(os.environ.get("MAX_DIAS_PROGRAMAR", "30")))
+
+BANDEJA = DATA_DIR / "bandeja"      # fotos esperando ser usadas
+USADAS = DATA_DIR / "usadas"        # fotos ya programadas/publicadas
+REGISTRO = DATA_DIR / "registro.jsonl"
+EXTENSIONES = {".jpg", ".jpeg", ".png", ".webp", ".gif", ".bmp"}
+MAX_BYTES_META = 4 * 1024 * 1024    # comprimimos por encima de esto
+
+for d in (BANDEJA, USADAS):
+    d.mkdir(parents=True, exist_ok=True)
+
+if len(SECRET) < 24:
+    raise SystemExit(
+        "MCP_SECRET falta o es muy corto (mínimo 24 caracteres). "
+        f"Generá uno con: python -c \"import secrets;print(secrets.token_urlsafe(32))\"\n"
+        f"Ejemplo: {secrets.token_urlsafe(32)}"
+    )
+if not DRY_RUN and (not PAGE_ID or not PAGE_TOKEN):
+    raise SystemExit("Faltan FB_PAGE_ID y/o FB_PAGE_TOKEN (o activá FB_DRY_RUN=1 para probar).")
+
+if PUBLIC_HOST:
+    seguridad = TransportSecuritySettings(
+        enable_dns_rebinding_protection=True,
+        allowed_hosts=[PUBLIC_HOST, f"{PUBLIC_HOST}:*", "localhost:*", "127.0.0.1:*"],
+        allowed_origins=[f"https://{PUBLIC_HOST}", "https://claude.ai"],
+    )
+else:
+    seguridad = TransportSecuritySettings(enable_dns_rebinding_protection=False)
+
+mcp = FastMCP(
+    name="facebook-multiplanet",
+    instructions=(
+        "Publica y programa posts en la página de Facebook de Multiplanet (Tocoa, Honduras). "
+        "Las fotos se suben a la bandeja desde la página web del servidor; usá listar_imagenes y "
+        "ver_imagen para conocerlas antes de escribir el texto. Para archivos del chat usá "
+        "programar_post_con_imagenes o verificar_imagenes_chat. Las fechas se interpretan en hora "
+        "de Honduras si no traen zona horaria. Meta solo permite programar entre 10 minutos y 30 "
+        "días adelante. Antes de programar una tanda, mostrale al usuario los textos y horarios."
+    ),
+    host=os.environ.get("HOST", "0.0.0.0"),
+    port=PORT,
+    streamable_http_path=f"/mcp/{SECRET}",
+    stateless_http=True,
+    json_response=True,
+    transport_security=seguridad,
+)
+
+# ---------------------------------------------------------------------------
+# Utilidades
+# ---------------------------------------------------------------------------
+
+
+class ErrorFacebook(Exception):
+    pass
+
+
+def _nombre_seguro(nombre: str) -> str:
+    base = Path(nombre).name
+    base = re.sub(r"[^A-Za-z0-9._-]+", "_", base).strip("._") or "imagen"
+    return base[:120]
+
+
+def _ruta_bandeja(nombre: str) -> Path:
+    ruta = (BANDEJA / _nombre_seguro(nombre)).resolve()
+    if ruta.parent != BANDEJA.resolve() or not ruta.is_file():
+        raise ValueError(f"No existe '{nombre}' en la bandeja. Usá listar_imagenes para ver los nombres.")
+    return ruta
+
+
+def _parse_fecha(fecha: str) -> datetime:
+    """Acepta '2026-11-20 09:00', '2026-11-20T09:00', con o sin zona horaria."""
+    try:
+        dt = datetime.fromisoformat(fecha.strip().replace("Z", "+00:00"))
+    except ValueError as e:
+        raise ValueError(f"Fecha inválida '{fecha}'. Usá el formato AAAA-MM-DD HH:MM.") from e
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=TZ)
+    return dt
+
+
+def _validar_programacion(dt: datetime) -> int:
+    ahora = datetime.now(TZ)
+    if dt - ahora < MIN_ANTICIPACION:
+        raise ValueError(
+            f"{dt:%Y-%m-%d %H:%M} está a menos de 10 minutos (o ya pasó). Meta exige al menos 10 min."
+        )
+    if dt - ahora > MAX_ANTICIPACION:
+        raise ValueError(
+            f"{dt:%Y-%m-%d %H:%M} está a más de {MAX_ANTICIPACION.days} días. Meta no deja programar tan lejos."
+        )
+    return int(dt.timestamp())
+
+
+def _fmt_ts(ts: int | float | str | None) -> str:
+    if ts in (None, ""):
+        return "—"
+    return datetime.fromtimestamp(int(float(ts)), TZ).strftime("%Y-%m-%d %H:%M")
+
+
+def _preparar_imagen(ruta: Path) -> tuple[bytes, str]:
+    """Devuelve bytes listos para Meta: corrige rotación EXIF y comprime si pesa mucho."""
+    if ruta.suffix.lower() in {".jpg", ".jpeg", ".png"} and ruta.stat().st_size <= MAX_BYTES_META:
+        mime = "image/png" if ruta.suffix.lower() == ".png" else "image/jpeg"
+        return ruta.read_bytes(), mime
+    with PILImage.open(ruta) as im:
+        im = ImageOps.exif_transpose(im).convert("RGB")
+        im.thumbnail((2048, 2048))
+        calidad = 90
+        while True:
+            buf = io.BytesIO()
+            im.save(buf, "JPEG", quality=calidad, optimize=True)
+            if buf.tell() <= MAX_BYTES_META or calidad <= 50:
+                return buf.getvalue(), "image/jpeg"
+            calidad -= 10
+
+
+def _registrar(evento: dict) -> None:
+    evento["cuando"] = datetime.now(TZ).isoformat(timespec="seconds")
+    with REGISTRO.open("a", encoding="utf-8") as f:
+        f.write(json.dumps(evento, ensure_ascii=False) + "\n")
+
+
+async def _graph(metodo: str, ruta: str, data: dict | None = None, files: dict | None = None,
+                 params: dict | None = None) -> dict:
+    """Llama a la Graph API y convierte los errores de Meta en mensajes claros."""
+    if DRY_RUN:
+        falso = f"{PAGE_ID or '000'}_{int(time.time() * 1000)}"
+        return {"id": falso, "dry_run": True, "data": []}
+    url = f"{GRAPH_URL}/{GRAPH_VERSION}/{ruta.lstrip('/')}"
+    params = {**(params or {}), "access_token": PAGE_TOKEN}
+    try:
+        async with httpx.AsyncClient(timeout=90) as cliente:
+            r = await cliente.request(metodo, url, params=params, data=data, files=files)
+    except httpx.HTTPError:
+        raise ErrorFacebook("No pude completar la solicitud a Meta.") from None
+    try:
+        cuerpo = r.json()
+    except ValueError:
+        cuerpo = {"raw": r.text[:500]}
+    if r.status_code >= 400 or "error" in cuerpo:
+        err = cuerpo.get("error", {})
+        msg = err.get("error_user_msg") or err.get("message") or str(cuerpo)[:300]
+        msg = str(msg).replace(PAGE_TOKEN, "[oculto]")
+        codigo = err.get("code")
+        pista = ""
+        if codigo == 190:
+            pista = " → El token venció o es inválido: generá uno nuevo con obtener_token.py."
+        elif codigo in (10, 200):
+            pista = " → Falta el permiso pages_manage_posts o no sos admin de la página."
+        elif codigo in (4, 17, 32, 613):
+            pista = " → Límite de llamadas de Meta; esperá unos minutos."
+        raise ErrorFacebook(f"Meta respondió error {codigo}: {msg}{pista}")
+    return cuerpo
+
+
+async def _subir_fotos(nombres: list[str]) -> list[str]:
+    """Sube fotos como no publicadas/temporales y devuelve sus IDs para adjuntar al post."""
+    ids = []
+    for nombre in nombres:
+        ruta = _ruta_bandeja(nombre)
+        datos, mime = _preparar_imagen(ruta)
+        res = await _graph(
+            "POST", f"{PAGE_ID}/photos",
+            data={"published": "false", "temporary": "true"},
+            files={"source": (ruta.name, datos, mime)},
+        )
+        ids.append(res["id"])
+    return ids
+
+
+def _mover_a_usadas(nombres: list[str]) -> None:
+    destino = USADAS / datetime.now(TZ).strftime("%Y-%m-%d")
+    destino.mkdir(parents=True, exist_ok=True)
+    for nombre in nombres:
+        try:
+            ruta = _ruta_bandeja(nombre)
+            shutil.move(str(ruta), destino / ruta.name)
+        except (ValueError, OSError):
+            pass
+
+
+async def _crear_post(texto: str, imagenes: list[str], link: str | None,
+                      programado_ts: int | None) -> dict:
+    if not texto.strip() and not imagenes and not link:
+        raise ValueError("El post necesita al menos texto, una imagen o un link.")
+    if imagenes and link:
+        raise ValueError("Facebook no combina fotos y vista previa de link en el mismo post: elegí uno.")
+    if len(imagenes) > 10:
+        raise ValueError("Máximo 10 imágenes por post.")
+    for n in imagenes:  # validar antes de subir nada
+        _ruta_bandeja(n)
+
+    data: dict[str, str] = {}
+    if texto.strip():
+        data["message"] = texto
+    if link:
+        data["link"] = link
+    if imagenes:
+        for i, fbid in enumerate(await _subir_fotos(imagenes)):
+            data[f"attached_media[{i}]"] = json.dumps({"media_fbid": fbid})
+    if programado_ts is not None:
+        data["published"] = "false"
+        data["scheduled_publish_time"] = str(programado_ts)
+
+    res = await _graph("POST", f"{PAGE_ID}/feed", data=data)
+    _mover_a_usadas(imagenes)
+    _registrar({"accion": "programado" if programado_ts else "publicado", "post_id": res.get("id"),
+                "hora": _fmt_ts(programado_ts) if programado_ts else "ahora",
+                "imagenes": imagenes, "texto": texto[:200]})
+    return res
+
+
+# ---------------------------------------------------------------------------
+# Herramientas MCP
+# ---------------------------------------------------------------------------
+
+
+
+class ArchivoChat(TypedDict):
+    download_url: str
+    file_id: str
+    mime_type: NotRequired[str]
+    file_name: NotRequired[str]
+
+
+ArchivosChat = Annotated[list[ArchivoChat], Field(min_length=1, max_length=10)]
+META_ARCHIVOS_CHAT = {"openai/fileParams": ["imagenes"]}
+ERROR_ARCHIVO_CHAT = (
+    "ChatGPT no entregó un enlace de descarga para la imagen. "
+    "Adjuntala de nuevo desde ChatGPT web o usá la página /subir."
+)
+FORMATOS_CHAT = {
+    "JPEG": ".jpg", "PNG": ".png", "WEBP": ".webp",
+    "GIF": ".gif", "BMP": ".bmp",
+}
+MAX_BYTES_CHAT = 25 * 1024 * 1024
+MAX_PIXELES_CHAT = 12_000_000
+
+
+def _url_archivo_chat(archivo: ArchivoChat) -> httpx.URL:
+    if not archivo["download_url"].strip() or not archivo["file_id"].strip():
+        raise ValueError(ERROR_ARCHIVO_CHAT)
+    mime = archivo.get("mime_type", "").split(";", 1)[0].strip().lower()
+    if mime and not mime.startswith("image/") and mime != "application/octet-stream":
+        raise ValueError("Adjuntá un archivo de imagen.")
+    try:
+        url = httpx.URL(archivo["download_url"])
+    except (httpx.InvalidURL, ValueError):
+        raise ValueError("El enlace de descarga del archivo es inválido.") from None
+    host = url.host.lower()
+    if (
+        url.scheme != "https" or url.port not in (None, 443) or url.userinfo
+        or not (host == "oaiusercontent.com" or host.endswith(".oaiusercontent.com"))
+    ):
+        raise ValueError(
+            "El enlace debe ser HTTPS y de oaiusercontent.com. "
+            "Si ChatGPT no entrega un enlace compatible, usá la página /subir."
+        )
+    return url
+
+
+async def _descargar_archivo_chat(cliente: httpx.AsyncClient, url: httpx.URL, ruta: Path) -> int:
+    try:
+        async with asyncio.timeout(45):
+            async with cliente.stream("GET", url, headers={"Accept-Encoding": "identity"}) as r:
+                r.raise_for_status()
+                if r.headers.get("Content-Encoding", "identity").lower() != "identity":
+                    raise ValueError("El servidor envió una codificación de descarga incompatible.")
+                longitud = r.headers.get("Content-Length", "")
+                if longitud.isascii() and longitud.isdecimal() and int(longitud) > MAX_BYTES_CHAT:
+                    raise ValueError("Cada imagen puede pesar hasta 25 MiB.")
+                total = 0
+                with ruta.open("wb") as salida:
+                    async for bloque in r.aiter_raw(64 * 1024):
+                        total += len(bloque)
+                        if total > MAX_BYTES_CHAT:
+                            raise ValueError("Cada imagen puede pesar hasta 25 MiB.")
+                        salida.write(bloque)
+                return total
+    except (httpx.HTTPError, httpx.InvalidURL, TimeoutError):
+        raise ValueError(
+            "No pude descargar la imagen. Volvé a adjuntarla desde ChatGPT web "
+            "para obtener un enlace nuevo o usá la página /subir."
+        ) from None
+
+
+def _inspeccionar_archivo_chat(ruta: Path) -> tuple[str, int, int]:
+    try:
+        with PILImage.open(ruta, formats=list(FORMATOS_CHAT)) as im:
+            ancho, alto = im.size
+            if ancho * alto > MAX_PIXELES_CHAT:
+                raise ValueError("Cada imagen puede tener hasta 12 megapíxeles.")
+            extension = FORMATOS_CHAT[im.format]
+            im.load()
+    except (OSError, SyntaxError, PILImage.DecompressionBombError):
+        raise ValueError("El archivo debe ser una imagen válida JPEG, PNG, WEBP, GIF o BMP.") from None
+    return extension, ancho, alto
+
+
+async def _recibir_archivos_chat(
+    imagenes: ArchivosChat | str | list[ArchivoChat | str], temporal: Path,
+) -> list[tuple[Path, int, int, int]]:
+    if isinstance(imagenes, str) or any(isinstance(archivo, str) for archivo in imagenes):
+        raise ValueError(ERROR_ARCHIVO_CHAT)
+
+    urls = [_url_archivo_chat(archivo) for archivo in imagenes]
+    recibidas = []
+    async with httpx.AsyncClient(timeout=15, follow_redirects=False, trust_env=False) as cliente:
+        for indice, (archivo, url) in enumerate(zip(imagenes, urls), 1):
+            parcial = temporal / f"{indice}.descarga"
+            total = await _descargar_archivo_chat(cliente, url, parcial)
+            extension, ancho, alto = _inspeccionar_archivo_chat(parcial)
+            original = _nombre_seguro(archivo.get("file_name") or "imagen")
+            base = Path(original).stem[:80]
+            ruta = temporal / _nombre_seguro(f"{base}-{secrets.token_hex(12)}{extension}")
+            parcial.rename(ruta)
+            recibidas.append((ruta, total, ancho, alto))
+    return recibidas
+
+
+# Esta segunda variante acepta los marcadores de clientes antiguos en ejecución.
+# El descriptor anuncia el arreglo de objetos exigido por el escáner de ChatGPT.
+ArchivosChatConMarcador = Annotated[list[ArchivoChat | str], Field(min_length=1, max_length=10)]
+EntradaArchivosChat = ArchivosChat | SkipJsonSchema[str | ArchivosChatConMarcador]
+_archivos_chat_en_curso = asyncio.Lock()
+
+
+@mcp.tool(
+    meta=META_ARCHIVOS_CHAT,
+    annotations=ToolAnnotations(readOnlyHint=True, destructiveHint=False, openWorldHint=True),
+)
+async def verificar_imagenes_chat(imagenes: EntradaArchivosChat) -> str:
+    """Comprueba que llegaron las imágenes del chat, su formato, tamaño y dimensiones.
+    Usa archivos temporales. No sube fotos a Facebook ni guarda imágenes en la bandeja.
+    """
+    async with _archivos_chat_en_curso:
+        with TemporaryDirectory(prefix="fbmcp-chat-") as carpeta:
+            recibidas = await _recibir_archivos_chat(imagenes, Path(carpeta))
+            filas = [
+                f"- Imagen {i}: {ruta.suffix[1:].upper()}, {ancho}×{alto}, {total:,} bytes"
+                for i, (ruta, total, ancho, alto) in enumerate(recibidas, 1)
+            ]
+    return "\n".join([f"Verifiqué {len(filas)} imagen(es). Sin cambios en Facebook.", *filas])
+
+
+@mcp.tool(
+    meta=META_ARCHIVOS_CHAT,
+    annotations=ToolAnnotations(
+        readOnlyHint=False, destructiveHint=False, idempotentHint=False, openWorldHint=True,
+    ),
+)
+async def programar_post_con_imagenes(
+    texto: str, imagenes: EntradaArchivosChat, fecha: str | None = None,
+) -> str:
+    """Publica o programa un post con entre 1 y 10 imágenes adjuntas del chat.
+    Usá esta herramienta solo cuando el usuario autorice publicar o programar.
+    Si omitís fecha, publica de inmediato. Sin zona horaria se usa la de Honduras.
+    Para comprobar las imágenes sin publicar, usá verificar_imagenes_chat.
+    """
+    dt = _parse_fecha(fecha) if fecha is not None else None
+    ts = _validar_programacion(dt) if dt is not None else None
+    async with _archivos_chat_en_curso:
+        with TemporaryDirectory(prefix=".chat-", dir=DATA_DIR) as carpeta:
+            recibidas = await _recibir_archivos_chat(imagenes, Path(carpeta))
+            if dt is not None:
+                ts = _validar_programacion(dt)
+            nombres = []
+            try:
+                for ruta, _, _, _ in recibidas:
+                    ruta.rename(BANDEJA / ruta.name)
+                    nombres.append(ruta.name)
+            except OSError:
+                for nombre in nombres:
+                    (BANDEJA / nombre).unlink(missing_ok=True)
+                raise
+        res = await _crear_post(texto, nombres, None, ts)
+
+    extra = " (simulado)" if res.get("dry_run") else ""
+    if dt is None:
+        return f"Publicado{extra}. ID: {res.get('id')}"
+    return f"Programado{extra} para {dt.astimezone(TZ):%Y-%m-%d %H:%M} (hora Honduras). ID: {res.get('id')}"
+
+
+
+@mcp.tool()
+async def info_pagina() -> str:
+    """Muestra nombre, seguidores y enlace de la página de Facebook conectada. Útil para verificar que el token funciona."""
+    if DRY_RUN:
+        return "Modo prueba (FB_DRY_RUN=1): no hay conexión real con Facebook."
+    p = await _graph("GET", PAGE_ID, params={"fields": "name,followers_count,fan_count,link,category"})
+    return (f"Página: {p.get('name')} ({p.get('category', '')})\n"
+            f"Seguidores: {p.get('followers_count', p.get('fan_count', '?'))}\n"
+            f"Enlace: {p.get('link', '')}")
+
+
+@mcp.tool()
+def listar_imagenes() -> str:
+    """Lista las fotos en la bandeja (subidas y aún no usadas) con tamaño y dimensiones."""
+    filas = []
+    for ruta in sorted(BANDEJA.iterdir(), key=lambda p: p.stat().st_mtime):
+        if ruta.suffix.lower() not in EXTENSIONES:
+            continue
+        try:
+            with PILImage.open(ruta) as im:
+                dims = f"{im.width}x{im.height}"
+        except Exception:
+            dims = "?"
+        subida = datetime.fromtimestamp(ruta.stat().st_mtime, TZ).strftime("%Y-%m-%d %H:%M")
+        filas.append(f"- {ruta.name}  ({dims}, {ruta.stat().st_size // 1024} KB, subida {subida})")
+    if not filas:
+        return "La bandeja está vacía. Subí fotos en la página /subir del servidor."
+    return f"{len(filas)} imagen(es) en la bandeja:\n" + "\n".join(filas)
+
+
+@mcp.tool()
+def ver_imagen(nombre: str) -> Image:
+    """Devuelve una vista previa de una foto de la bandeja para poder describir el producto y escribir el texto del post."""
+    ruta = _ruta_bandeja(nombre)
+    with PILImage.open(ruta) as im:
+        im = ImageOps.exif_transpose(im).convert("RGB")
+        im.thumbnail((768, 768))
+        buf = io.BytesIO()
+        im.save(buf, "JPEG", quality=80)
+    return Image(data=buf.getvalue(), format="jpeg")
+
+
+@mcp.tool()
+async def programar_post(texto: str, fecha: str, imagenes: list[str] | None = None,
+                         link: str | None = None) -> str:
+    """Programa un post en la página de Facebook.
+
+    Args:
+        texto: Texto completo del post (con emojis y hashtags si se quieren).
+        fecha: Fecha y hora de publicación, ej. "2026-11-20 09:30". Sin zona = hora de Honduras.
+               Debe estar entre 10 minutos y 30 días en el futuro.
+        imagenes: Nombres de fotos de la bandeja (ver listar_imagenes). Hasta 10. Opcional.
+        link: URL para compartir con vista previa (no se combina con imágenes). Opcional.
+    """
+    dt = _parse_fecha(fecha)
+    ts = _validar_programacion(dt)
+    res = await _crear_post(texto, imagenes or [], link, ts)
+    extra = " (simulado)" if res.get("dry_run") else ""
+    return f"Programado{extra} para {dt.astimezone(TZ):%Y-%m-%d %H:%M} (hora Honduras). ID: {res.get('id')}"
+
+
+@mcp.tool()
+async def publicar_ahora(texto: str, imagenes: list[str] | None = None, link: str | None = None) -> str:
+    """Publica un post en la página de Facebook de inmediato.
+
+    Args:
+        texto: Texto del post.
+        imagenes: Nombres de fotos de la bandeja. Opcional, hasta 10.
+        link: URL para compartir (no se combina con imágenes). Opcional.
+    """
+    res = await _crear_post(texto, imagenes or [], link, None)
+    extra = " (simulado)" if res.get("dry_run") else ""
+    return f"Publicado{extra}. ID: {res.get('id')}"
+
+
+@mcp.tool()
+async def listar_programados(limite: int = 50) -> str:
+    """Lista los posts programados (pendientes) de la página, ordenados por hora de publicación."""
+    res = await _graph("GET", f"{PAGE_ID}/scheduled_posts", params={
+        "fields": "id,message,scheduled_publish_time,full_picture", "limit": str(min(limite, 100)),
+    })
+    posts = sorted(res.get("data", []), key=lambda p: int(p.get("scheduled_publish_time") or 0))
+    if not posts:
+        return "No hay posts programados."
+    lineas = [f"{len(posts)} post(s) programados:"]
+    for p in posts:
+        texto = (p.get("message") or "").replace("\n", " ")
+        foto = " [foto]" if p.get("full_picture") else ""
+        lineas.append(f"- {_fmt_ts(p.get('scheduled_publish_time'))}{foto} · {p['id']} · {texto[:90]}")
+    return "\n".join(lineas)
+
+
+@mcp.tool()
+async def reprogramar(post_id: str, fecha: str | None = None, texto: str | None = None) -> str:
+    """Cambia la hora y/o el texto de un post que todavía está programado.
+
+    Args:
+        post_id: ID del post (de listar_programados).
+        fecha: Nueva fecha y hora, ej. "2026-11-21 18:00". Opcional.
+        texto: Nuevo texto. Opcional.
+    """
+    if not fecha and texto is None:
+        raise ValueError("Indicá una nueva fecha, un nuevo texto o ambos.")
+    data: dict[str, str] = {}
+    if fecha:
+        data["scheduled_publish_time"] = str(_validar_programacion(_parse_fecha(fecha)))
+    if texto is not None:
+        data["message"] = texto
+    await _graph("POST", post_id, data=data)
+    _registrar({"accion": "reprogramado", "post_id": post_id, **{k: v[:200] for k, v in data.items()}})
+    return f"Post {post_id} actualizado."
+
+
+@mcp.tool()
+async def publicar_programado_ya(post_id: str) -> str:
+    """Publica inmediatamente un post que estaba programado para más tarde."""
+    await _graph("POST", post_id, data={"is_published": "true"})
+    _registrar({"accion": "adelantado", "post_id": post_id})
+    return f"Post {post_id} publicado ahora."
+
+
+@mcp.tool()
+async def borrar_post(post_id: str) -> str:
+    """Borra un post (programado o publicado). Es irreversible: confirmá con el usuario antes."""
+    await _graph("DELETE", post_id)
+    _registrar({"accion": "borrado", "post_id": post_id})
+    return f"Post {post_id} borrado."
+
+
+@mcp.tool()
+async def posts_recientes(limite: int = 10) -> str:
+    """Lista los últimos posts publicados en la página (para no repetir textos o productos)."""
+    res = await _graph("GET", f"{PAGE_ID}/posts", params={
+        "fields": "id,message,created_time,permalink_url", "limit": str(min(limite, 50)),
+    })
+    posts = res.get("data", [])
+    if not posts:
+        return "No hay posts recientes."
+    lineas = []
+    for p in posts:
+        creado = p.get("created_time", "")[:16].replace("T", " ")
+        texto = (p.get("message") or "").replace("\n", " ")
+        lineas.append(f"- {creado} UTC · {texto[:90]} · {p.get('permalink_url', p['id'])}")
+    return "\n".join(lineas)
+
+
+# ---------------------------------------------------------------------------
+# Página web para subir fotos (protegida con el mismo secreto)
+# ---------------------------------------------------------------------------
+
+PAGINA_SUBIR = """<!doctype html><html lang="es"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1"><title>Bandeja · Multiplanet</title>
+<style>
+body{{font-family:system-ui,sans-serif;max-width:640px;margin:2rem auto;padding:0 1rem;background:#0f1115;color:#e8e8e8}}
+h1{{font-size:1.3rem}} .caja{{border:2px dashed #3a3f4b;border-radius:12px;padding:1.5rem;text-align:center}}
+input[type=file]{{margin:1rem 0}} button{{background:#1877f2;color:#fff;border:0;border-radius:8px;padding:.7rem 1.4rem;font-size:1rem}}
+ul{{list-style:none;padding:0;display:grid;grid-template-columns:repeat(auto-fill,minmax(110px,1fr));gap:.6rem}}
+li{{font-size:.7rem;word-break:break-all}} img{{width:100%;aspect-ratio:1;object-fit:cover;border-radius:8px}}
+.ok{{background:#14361f;padding:.6rem;border-radius:8px}}
+</style></head><body>
+<h1>Bandeja de fotos — Facebook Multiplanet</h1>
+{mensaje}
+<form class="caja" method="post" enctype="multipart/form-data">
+<div>Elegí una o varias fotos</div>
+<input type="file" name="fotos" accept="image/*" multiple required><br>
+<button type="submit">Subir</button></form>
+<h2 style="font-size:1rem">En la bandeja ({n})</h2><ul>{items}</ul>
+</body></html>"""
+
+
+@mcp.custom_route(f"/subir/{SECRET}", methods=["GET", "POST"], include_in_schema=False)
+async def subir(request: Request):
+    mensaje = ""
+    if request.method == "POST":
+        form = await request.form(max_files=100, max_part_size=25 * 1024 * 1024)
+        guardadas = 0
+        for archivo in form.getlist("fotos"):
+            if not getattr(archivo, "filename", None):
+                continue
+            nombre = _nombre_seguro(archivo.filename)
+            if Path(nombre).suffix.lower() not in EXTENSIONES:
+                continue
+            destino = BANDEJA / nombre
+            i = 1
+            while destino.exists():
+                destino = BANDEJA / f"{Path(nombre).stem}-{i}{Path(nombre).suffix}"
+                i += 1
+            destino.write_bytes(await archivo.read())
+            guardadas += 1
+        return RedirectResponse(f"/subir/{SECRET}?ok={guardadas}", status_code=303)
+    if "ok" in request.query_params:
+        mensaje = f'<p class="ok">Listo: {html.escape(request.query_params["ok"])} foto(s) subidas.</p>'
+    archivos = sorted((p for p in BANDEJA.iterdir() if p.suffix.lower() in EXTENSIONES),
+                      key=lambda p: p.stat().st_mtime, reverse=True)
+    items = "".join(
+        f'<li><img src="/foto/{SECRET}/{html.escape(p.name)}" loading="lazy">{html.escape(p.name)}</li>'
+        for p in archivos
+    )
+    return HTMLResponse(PAGINA_SUBIR.format(mensaje=mensaje, n=len(archivos), items=items))
+
+
+@mcp.custom_route(f"/foto/{SECRET}/{{nombre}}", methods=["GET"], include_in_schema=False)
+async def foto(request: Request):
+    from starlette.responses import FileResponse
+    try:
+        return FileResponse(_ruta_bandeja(request.path_params["nombre"]))
+    except ValueError:
+        return JSONResponse({"error": "no existe"}, status_code=404)
+
+
+PRIVACIDAD = """<!doctype html><html lang="es"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1"><title>Política de privacidad</title>
+<style>body{font-family:system-ui,sans-serif;max-width:680px;margin:2rem auto;padding:0 1rem;line-height:1.6}</style>
+</head><body><h1>Política de privacidad — Publicador de Multiplanet</h1>
+<p>Esta aplicación es una herramienta interna de Multiplanet (Barrio El Centro, Tocoa, Colón, Honduras)
+que publica y programa contenido únicamente en la página de Facebook propia de la empresa.</p>
+<p><b>Datos que usa:</b> el token de acceso de la página de Multiplanet y las imágenes y textos que el equipo
+de Multiplanet sube para publicar. No recopila datos de usuarios de Facebook ni de visitantes.</p>
+<p><b>Almacenamiento:</b> las imágenes y un registro de publicaciones se guardan en un servidor privado de la
+empresa. No se venden ni se comparten con terceros.</p>
+<p><b>Eliminación de datos:</b> como la app no guarda datos de otras personas, no hay datos de terceros que
+eliminar. Para cualquier consulta, contactá a Multiplanet a través de su página de Facebook.</p>
+</body></html>"""
+
+
+@mcp.custom_route("/privacidad", methods=["GET"], include_in_schema=False)
+async def privacidad(_: Request):
+    return HTMLResponse(PRIVACIDAD)
+
+
+@mcp.custom_route("/salud", methods=["GET"], include_in_schema=False)
+async def salud(_: Request):
+    return JSONResponse({"ok": True, "dry_run": DRY_RUN})
+
+
+if __name__ == "__main__":
+    print(f"MCP escuchando en :{PORT}  (ruta /mcp/<secreto>, subida /subir/<secreto>)"
+          + ("  [MODO PRUEBA]" if DRY_RUN else ""))
+    mcp.run(transport="streamable-http")

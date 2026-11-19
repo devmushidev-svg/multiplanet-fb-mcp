@@ -1,0 +1,26 @@
+services:
+  mcp:
+    build: .
+    env_file: .env
+    environment:
+      - PUBLIC_HOST=${DOMINIO}
+    volumes:
+      - ./data:/data
+    restart: unless-stopped
+
+  caddy:
+    image: caddy:2-alpine
+    ports:
+      - "80:80"
+      - "443:443"
+    environment:
+      - DOMINIO=${DOMINIO}
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+    depends_on:
+      - mcp
+    restart: unless-stopped
+
+volumes:
+  caddy_data:
