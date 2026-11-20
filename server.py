@@ -24,6 +24,8 @@ import re
 import secrets
 import shutil
 import time
+import sys
+from contextlib import asynccontextmanager, suppress
 from datetime import datetime, timedelta
 from pathlib import Path
 from tempfile import TemporaryDirectory
@@ -97,6 +99,18 @@ if PUBLIC_HOST:
 else:
     seguridad = TransportSecuritySettings(enable_dns_rebinding_protection=False)
 
+@asynccontextmanager
+async def vida_catalogo(_):
+    catalogo.recuperar_interrumpidos()
+    tarea = asyncio.create_task(ciclo_catalogo())
+    try:
+        yield {}
+    finally:
+        tarea.cancel()
+        with suppress(asyncio.CancelledError):
+            await tarea
+
+
 mcp = FastMCP(
     name="facebook-multiplanet",
     instructions=(
@@ -112,7 +126,14 @@ mcp = FastMCP(
         "programar_post_con_imagenes o verificar_imagenes_chat y pasá el archivo adjunto mismo en "
         "'imagenes'; nunca escribas rutas /mnt/data ni sandbox:. Las fechas se interpretan en hora "
         "de Honduras si no traen zona horaria. Meta solo permite programar entre 10 minutos y 30 "
-        "días adelante. Antes de programar una tanda, mostrale al usuario los textos y horarios."
+        "días adelante. Antes de programar una tanda, mostrale al usuario los textos y horarios. "
+        "Para guardar contenido sin publicar usá guardar_publicacion_catalogo; si las fotos vienen "
+        "adjuntas en el chat usá guardar_publicacion_catalogo_con_imagenes. Para lotes por tipo "
+        "usá listar_categorias_catalogo y preparar_lote_catalogo; mostrale el plan y solo llamá "
+        "confirmar_plan_catalogo después de su aprobación expresa. El catálogo admite fechas "
+        "más lejanas mediante una cola local durable que requiere el servidor encendido. "
+        "Los diseños de flores se eligen manualmente; los suministros florales sí admiten lotes. "
+        "No vuelvas a crear un plan si ya tenés su ID: consultá listar_agenda_catalogo."
     ),
     host=os.environ.get("HOST", "0.0.0.0"),
     port=PORT,
@@ -201,7 +222,7 @@ async def _graph(metodo: str, ruta: str, data: dict | None = None, files: dict |
                  params: dict | None = None, token: str | None = None) -> dict:
     """Llama a la Graph API y convierte los errores de Meta en mensajes claros."""
     if DRY_RUN:
-        falso = f"{ruta.split('/')[0] or '000'}_{int(time.time() * 1000)}"
+        falso = f"{ruta.split('/')[0] or '000'}_{secrets.token_hex(8)}"
         return {"id": falso, "dry_run": True, "data": []}
     url = f"{GRAPH_URL}/{GRAPH_VERSION}/{ruta.lstrip('/')}"
     params = {**(params or {}), "access_token": token or PAGE_TOKEN}
@@ -755,6 +776,8 @@ async def reprogramar(post_id: str, fecha: str | None = None, texto: str | None 
         data["message"] = texto
     token, nombre = _pagina_de_post(post_id, pagina)
     await _graph("POST", post_id, data=data, token=token)
+    catalogo.actualizar_desde_meta(post_id, fecha=int(data["scheduled_publish_time"]) if fecha else None,
+                                  texto=texto)
     _registrar({"accion": "reprogramado", "post_id": post_id, "pagina": nombre,
                 **{k: v[:200] for k, v in data.items()}})
     return f"Post {post_id} de {nombre} actualizado."
@@ -765,6 +788,7 @@ async def publicar_programado_ya(post_id: str, pagina: Pagina | None = None) -> 
     """Publica inmediatamente un post que estaba programado. Solo si el usuario lo pide."""
     token, nombre = _pagina_de_post(post_id, pagina)
     await _graph("POST", post_id, data={"is_published": "true"}, token=token)
+    catalogo.actualizar_desde_meta(post_id, estado="publicado", fecha=datetime.now(TZ).timestamp())
     _registrar({"accion": "adelantado", "post_id": post_id, "pagina": nombre})
     return f"Post {post_id} publicado ahora en {nombre}."
 
@@ -774,6 +798,7 @@ async def borrar_post(post_id: str, pagina: Pagina | None = None) -> str:
     """Borra un post (programado o publicado). Es irreversible: confirmá con el usuario antes."""
     token, nombre = _pagina_de_post(post_id, pagina)
     await _graph("DELETE", post_id, token=token)
+    catalogo.actualizar_desde_meta(post_id, estado="cancelado")
     _registrar({"accion": "borrado", "post_id": post_id, "pagina": nombre})
     return f"Post {post_id} de {nombre} borrado."
 
@@ -885,7 +910,28 @@ async def salud(_: Request):
     return JSONResponse({"ok": True, "dry_run": DRY_RUN})
 
 
+from catalogo_web import instalar as instalar_catalogo
+
+catalogo, ciclo_catalogo, enviar_uno_catalogo = instalar_catalogo(mcp, sys.modules[__name__])
+
+
+def crear_app():
+    """La cola vive con la aplicación, independientemente de las sesiones MCP."""
+    app = mcp.streamable_http_app()
+
+    @asynccontextmanager
+    async def vida_app(_):
+        async with mcp.session_manager.run():
+            async with vida_catalogo(app):
+                yield
+
+    app.router.lifespan_context = vida_app
+    return app
+
+
 if __name__ == "__main__":
     print(f"MCP escuchando en :{PORT}  (ruta /mcp/<secreto>, subida /subir/<secreto>)"
           + ("  [MODO PRUEBA]" if DRY_RUN else ""))
-    mcp.run(transport="streamable-http")
+    import uvicorn
+    # Un proceso: un único consumidor de la cola persistente.
+    uvicorn.run(crear_app(), host=mcp.settings.host, port=PORT)

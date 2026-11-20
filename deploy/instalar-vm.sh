@@ -15,6 +15,12 @@ apt-get install -y -qq python3-venv caddy curl >/dev/null
 mkdir -p "$base/data"
 cd "$base"
 curl -fsSL "$repo_raw/server.py" -o server.py
+curl -fsSL "$repo_raw/catalogo.py" -o catalogo.py
+curl -fsSL "$repo_raw/catalogo_web.py" -o catalogo_web.py
+mkdir -p web
+for archivo in catalogo.html catalogo.css catalogo.js; do
+    curl -fsSL "$repo_raw/web/$archivo" -o "web/$archivo"
+done
 curl -fsSL "$repo_raw/requirements.txt" -o requirements.txt
 [ -d venv ] || python3 -m venv venv
 venv/bin/pip install -q -r requirements.txt

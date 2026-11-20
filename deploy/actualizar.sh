@@ -3,48 +3,60 @@ set -eu
 
 base=/opt/fbmcp
 repo_raw="${FBMCP_RAW:-https://raw.githubusercontent.com/devmushidev-svg/multiplanet-fb-mcp/main}"
-target="$base/server.py"
 python="$base/venv/bin/python"
-candidate=$(mktemp "$base/.server.py.XXXXXX")
+candidate=$(mktemp -d "$base/.release.XXXXXX")
 sandbox=$(mktemp -d)
-trap 'rm -f "$candidate"; rmdir "$sandbox/bandeja" "$sandbox/usadas" "$sandbox" 2>/dev/null || true' EXIT
+trap 'rm -rf "$candidate" "$sandbox"' EXIT
+files="server.py catalogo.py catalogo_web.py web/catalogo.html web/catalogo.css web/catalogo.js"
+mkdir -p "$candidate/web"
+for file in $files; do
+    curl -fsSL --max-time 60 "$repo_raw/$file" -o "$candidate/$file"
+    [ -s "$candidate/$file" ] || { echo "Descarga vacía: $file" >&2; exit 1; }
+done
 
-curl -fsSL --max-time 60 "$repo_raw/server.py" -o "$candidate"
-[ -s "$candidate" ] || { echo "No pude descargar server.py desde GitHub." >&2; exit 1; }
-
-# Validar el candidato con el venv real y un entorno de prueba separado.
+# Validar todos los módulos y recursos con el venv real y datos aislados.
 if ! env -i PATH=/usr/bin:/bin PYTHONDONTWRITEBYTECODE=1 \
     FB_DRY_RUN=1 MCP_SECRET=secreto-local-para-preflight \
     DATA_DIR="$sandbox" "$python" - "$candidate" <<'PY'
 import asyncio
 import importlib.metadata
-import importlib.machinery
-import importlib.util
+import pathlib
 import sys
 
+sys.path.insert(0, sys.argv[1])
+import server
+
 print("SDK MCP", importlib.metadata.version("mcp"))
-loader = importlib.machinery.SourceFileLoader("fbmcp_candidate", sys.argv[1])
-spec = importlib.util.spec_from_loader(loader.name, loader)
-module = importlib.util.module_from_spec(spec)
-sys.modules[loader.name] = module
-loader.exec_module(module)
-tools = {tool.name: tool for tool in asyncio.run(module.mcp.list_tools())}
+tools = {tool.name: tool for tool in asyncio.run(server.mcp.list_tools())}
 for name in ("programar_post_con_imagenes", "verificar_imagenes_chat"):
     tool = tools[name]
     assert tool.meta["openai/fileParams"] == ["imagenes"]
     assert tool.inputSchema["properties"]["imagenes"]["maxItems"] == 10
 assert tools["verificar_imagenes_chat"].annotations.readOnlyHint
+assert "preparar_lote_catalogo" in tools
+assert "confirmar_plan_catalogo" in tools
+assert server.catalogo.categorias()
+assert server.crear_app()
+for asset in ("catalogo.html", "catalogo.css", "catalogo.js"):
+    assert (pathlib.Path(sys.argv[1]) / "web" / asset).stat().st_size
 PY
 then
-    echo "Falló la comprobación con el venv de fbmcp. No se reemplazó server.py." >&2
+    echo "Falló la comprobación. No se cambió la versión instalada." >&2
     exit 1
 fi
 
-backup=$(mktemp "$base/server.py.bak.XXXXXX")
-cp -p "$target" "$backup"
-chown --reference="$target" "$candidate"
-chmod --reference="$target" "$candidate"
-mv -f "$candidate" "$target"
+backup=$(mktemp -d "$base/respaldo.XXXXXX")
+mkdir -p "$backup/web" "$base/web"
+for file in $files; do
+    if [ -f "$base/$file" ]; then
+        cp -p "$base/$file" "$backup/$file"
+    fi
+    chmod 644 "$candidate/$file"
+    chown --reference="$base/server.py" "$candidate/$file"
+done
+for file in $files; do
+    mv -f "$candidate/$file" "$base/$file"
+done
 
 salud() {
     for intento in 1 2 3 4 5 6 7 8 9 10; do
@@ -60,13 +72,17 @@ salud() {
 }
 
 if systemctl restart fbmcp && salud; then
-    echo "fbmcp activo. Respaldo: $backup"
+    echo "fbmcp activo con catálogo. Respaldo: $backup"
 else
-    echo "Falló el arranque. Restaurando server.py desde $backup." >&2
-    cp -p "$backup" "$candidate"
-    mv -f "$candidate" "$target"
+    echo "Falló el arranque. Restaurando la versión anterior desde $backup." >&2
+    for file in $files; do
+        if [ -f "$backup/$file" ]; then
+            cp -p "$backup/$file" "$base/$file"
+        else
+            rm -f "$base/$file"
+        fi
+    done
     systemctl restart fbmcp
     salud
     exit 1
 fi
-

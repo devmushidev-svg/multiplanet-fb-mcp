@@ -1,0 +1,457 @@
+<!doctype html>
+<html lang="es">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="referrer" content="no-referrer" />
+    <title>Catálogo de publicaciones · Multiplanet</title>
+    <link
+      rel="icon"
+      href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'%3E%3Crect width='64' height='64' rx='14' fill='%23132b31'/%3E%3Ctext x='9' y='44' fill='%23d8f381' font-family='sans-serif' font-size='40' font-weight='bold'%3Em%3C/text%3E%3C/svg%3E"
+    />
+    <link rel="stylesheet" href="/catalogo-assets/__SECRET__/catalogo.css" />
+    <script defer src="/catalogo-assets/__SECRET__/catalogo.js"></script>
+  </head>
+  <body>
+    <aside class="sidebar">
+      <a class="brand" href="#"
+        ><span class="brand-symbol">m<span>p</span></span
+        ><span>multiplanet<small>ESTUDIO DE CONTENIDO</small></span></a
+      >
+      <div class="workspace">
+        <span class="workspace-icon">M</span>
+        <div>Tu espacio de trabajo<small>Tocoa, Honduras</small></div>
+      </div>
+      <p class="nav-label">CONTENIDO</p>
+      <nav aria-label="Principal">
+        <button class="nav-item selected" id="nav-catalogo">
+          <span aria-hidden="true">▦</span> Catálogo
+          <span class="counter" id="nav-count">0</span>
+        </button>
+        <button class="nav-item" id="nav-agenda">
+          <span aria-hidden="true">▤</span> Agenda
+          <span class="counter" id="queue-count">0</span>
+        </button>
+      </nav>
+      <div class="category-title">
+        <p class="nav-label">TUS CATEGORÍAS</p>
+        <button
+          id="add-category"
+          class="icon-button"
+          aria-label="Nueva categoría"
+        >
+          +
+        </button>
+      </div>
+      <nav id="categories" aria-label="Categorías"></nav>
+      <div class="sidebar-bottom">
+        <span class="chat-icon">✦</span><strong>También desde ChatGPT</strong>
+        <p>
+          Guardá contenido y prepará tus próximos lotes con una conversación.
+        </p>
+        <a id="upload-link" href="#">Abrir bandeja de fotos</a>
+      </div>
+      <div class="account">
+        <span class="avatar">MP</span>
+        <div>Multiplanet<small>Catálogo privado</small></div>
+      </div>
+    </aside>
+
+    <main>
+      <header class="topbar">
+        <span
+          >Espacio de trabajo <span class="slash">/</span>
+          <strong id="breadcrumb">Catálogo</strong></span
+        ><span class="timezone" id="timezone">Hora de Honduras</span>
+      </header>
+      <div class="content">
+        <div id="mode-banner" class="mode-banner" hidden>
+          <strong>Modo de prueba</strong> Podés probar todo el flujo. Los envíos
+          se simulan y no publican en Facebook.
+        </div>
+        <div class="page-heading">
+          <div>
+            <p class="eyebrow">TU CONTENIDO, ORGANIZADO</p>
+            <h1 id="page-title">Catálogo de publicaciones</h1>
+            <p id="page-description">
+              Guardá tus ideas hoy. Dejá listas tus próximas publicaciones.
+            </p>
+          </div>
+          <div class="heading-actions">
+            <button class="button secondary" id="batch-open">
+              Programar un lote</button
+            ><button class="button primary" id="new-open">
+              <span aria-hidden="true">+</span> Nueva publicación
+            </button>
+          </div>
+        </div>
+
+        <section class="stats" aria-label="Resumen del catálogo">
+          <div class="stat">
+            <span class="stat-label"
+              >En tu catálogo <span aria-hidden="true">▦</span></span
+            ><strong id="stat-total">0</strong
+            ><small>Publicaciones guardadas</small>
+          </div>
+          <div class="stat">
+            <span class="stat-label"
+              >Listas para lotes <span aria-hidden="true">✦</span></span
+            ><strong id="stat-ready">0</strong
+            ><small>Aprobadas, vigentes y sin usar</small>
+          </div>
+          <div class="stat">
+            <span class="stat-label"
+              >En agenda <span aria-hidden="true">▤</span></span
+            ><strong id="stat-agenda">0</strong
+            ><small>Pendientes o entregadas a Meta</small>
+          </div>
+          <div class="stat">
+            <span class="stat-label"
+              >Selección manual <span aria-hidden="true">❋</span></span
+            ><strong id="stat-manual">0</strong
+            ><small>Contenido que elegís vos</small>
+          </div>
+        </section>
+
+        <section id="catalogue-section">
+          <div class="section-heading">
+            <div>
+              <h2 id="category-heading">Todas las publicaciones</h2>
+              <span id="result-count" class="muted">0 publicaciones</span>
+            </div>
+            <button id="refresh" class="text-button">Actualizar</button>
+          </div>
+          <div class="filters">
+            <label class="search"
+              ><span aria-hidden="true">⌕</span
+              ><input
+                id="search"
+                type="search"
+                placeholder="Buscar un título o texto…"
+                aria-label="Buscar publicaciones" /></label
+            ><select id="filter-category" aria-label="Filtrar por categoría">
+              <option value="">Todas las categorías</option></select
+            ><select id="filter-page" aria-label="Filtrar por página">
+              <option value="">Todas las páginas</option></select
+            ><select id="filter-status" aria-label="Filtrar por estado">
+              <option value="active">Contenido activo</option>
+              <option value="ready">Listo para lotes</option>
+              <option value="manual">Selección manual</option>
+              <option value="archived">Archivado</option>
+            </select>
+          </div>
+          <div id="cards" class="cards"></div>
+          <div id="empty" class="empty" hidden>
+            <div class="empty-art" aria-hidden="true">▧<span>+</span></div>
+            <h2 id="empty-title">Tu próxima publicación empieza acá</h2>
+            <p id="empty-description">
+              Guardá una imagen y su texto, elegí una categoría y armá tu
+              biblioteca de contenido.
+            </p>
+            <button class="button primary" id="empty-create">
+              Crear una publicación
+            </button>
+          </div>
+          <div class="manual-note">
+            <span aria-hidden="true">❋</span>
+            <div>
+              <strong>Los diseños de flores tienen su propio momento.</strong>
+              <p>
+                Elegilos manualmente según temporada y tendencia. Los
+                suministros florales sí pueden formar parte de un lote.
+              </p>
+            </div>
+          </div>
+        </section>
+
+        <section id="agenda-section" hidden>
+          <div class="section-heading">
+            <div>
+              <h2>Tu agenda de publicaciones</h2>
+              <p class="muted">
+                Revisá borradores, próximos envíos y el estado de cada
+                publicación.
+              </p>
+            </div>
+            <button id="refresh-agenda" class="text-button">Actualizar</button>
+          </div>
+          <p class="agenda-note">
+            Los planes confirmados se envían automáticamente mientras el
+            servidor esté encendido. “En Meta” indica que Facebook recibió la
+            programación; no verifica que ya esté publicada.
+          </p>
+          <div class="table-wrap">
+            <table>
+              <thead>
+                <tr>
+                  <th>Fecha · Honduras</th>
+                  <th>Publicación</th>
+                  <th>Página</th>
+                  <th>Estado</th>
+                  <th>Plan</th>
+                </tr>
+              </thead>
+              <tbody id="agenda-rows"></tbody>
+            </table>
+          </div>
+          <p id="agenda-empty" class="empty-inline" hidden>
+            Todavía no hay publicaciones en agenda. Prepará tu primer lote desde
+            el catálogo.
+          </p>
+        </section>
+        <footer>
+          Hecho para Multiplanet <span>Catálogo + ChatGPT + Facebook</span>
+        </footer>
+      </div>
+    </main>
+
+    <dialog id="editor">
+      <form id="editor-form">
+        <div class="dialog-heading">
+          <div>
+            <p class="eyebrow">BIBLIOTECA DE CONTENIDO</p>
+            <h2 id="editor-title">Nueva publicación</h2>
+          </div>
+          <button
+            type="button"
+            class="icon-button close"
+            data-close="editor"
+            aria-label="Cerrar"
+          >
+            ×
+          </button>
+        </div>
+        <input type="hidden" name="id" />
+        <label
+          >Título interno<input
+            name="titulo"
+            maxlength="160"
+            placeholder="Ej. Mantenimiento preventivo de impresoras"
+            required
+        /></label>
+        <div class="form-row">
+          <label>Categoría<select name="categoria" required></select></label
+          ><label
+            >Página de Facebook<select name="pagina" required></select
+          ></label>
+        </div>
+        <label
+          >Texto de la publicación<textarea
+            name="texto"
+            rows="5"
+            maxlength="60000"
+            placeholder="Escribí el texto que acompañará tu publicación…"
+          ></textarea>
+        </label>
+        <label class="upload-area"
+          >Fotos de la publicación<span
+            >Hasta 10 imágenes · 25 MiB por imagen</span
+          ><input type="file" name="fotos" accept="image/*" multiple
+        /></label>
+        <div id="existing-images" class="image-list"></div>
+        <label
+          >Enlace opcional<input
+            name="link"
+            type="url"
+            placeholder="https://…"
+          /><small>Usá fotos o un enlace con vista previa.</small></label
+        >
+        <label
+          >Vigente hasta <span class="optional">(opcional)</span
+          ><input name="vence" type="date" /><small
+            >Ideal para promociones o contenido de temporada.</small
+          ></label
+        >
+        <label class="checkbox"
+          ><input name="automatica" type="checkbox" /><span
+            ><strong>Aprobar para programación por lotes</strong
+            ><small id="automatic-help"
+              >El contenido podrá seleccionarse cuando pidas programar esta
+              categoría.</small
+            ></span
+          ></label
+        >
+        <label class="checkbox"
+          ><input name="activa" type="checkbox" checked /><span
+            >Contenido activo en el catálogo</span
+          ></label
+        >
+        <p class="form-error" role="alert"></p>
+        <div class="dialog-actions">
+          <span>Guardar no publica ni modifica planes ya preparados.</span
+          ><button type="submit" class="button primary">
+            Guardar publicación
+          </button>
+        </div>
+      </form>
+    </dialog>
+
+    <dialog id="batch">
+      <form id="batch-form">
+        <div class="dialog-heading">
+          <div>
+            <p class="eyebrow">PLANIFICÁ CON TIEMPO</p>
+            <h2>Programar un lote</h2>
+          </div>
+          <button
+            type="button"
+            class="icon-button close"
+            data-close="batch"
+            aria-label="Cerrar"
+          >
+            ×
+          </button>
+        </div>
+        <p class="muted">
+          Elegimos publicaciones distintas y aprobadas, y las distribuimos en el
+          período. Vas a revisar el plan antes de confirmarlo.
+        </p>
+        <label
+          >Tipo de publicación<select name="categoria" required></select
+        ></label>
+        <label
+          >Página de Facebook<select name="pagina" required></select
+        ></label>
+        <div class="form-row">
+          <label
+            >Publicaciones<input
+              type="number"
+              name="cantidad"
+              min="1"
+              max="500"
+              value="10"
+              required /></label
+          ><label
+            >Durante cuántos días<input
+              type="number"
+              name="dias"
+              min="1"
+              max="365"
+              value="7"
+              required
+          /></label>
+        </div>
+        <label>Comenzando el<input type="date" name="inicio" required /></label>
+        <label
+          >Horarios disponibles · Honduras<input
+            name="horas"
+            value="09:00, 12:00, 15:00, 18:00"
+            required
+          /><small
+            >Separá las horas con comas. Se usa un horario por
+            publicación.</small
+          ></label
+        >
+        <div class="info-box">
+          Las flores se programan una por una. Si falta contenido, te avisamos
+          sin repetir publicaciones.
+        </div>
+        <p class="form-error" role="alert"></p>
+        <div class="dialog-actions">
+          <span>Todavía no se enviará a Facebook.</span
+          ><button type="submit" class="button primary">
+            Preparar vista previa
+          </button>
+        </div>
+      </form>
+    </dialog>
+
+    <dialog id="individual">
+      <form id="individual-form">
+        <div class="dialog-heading">
+          <h2>Programar publicación</h2>
+          <button
+            type="button"
+            class="icon-button close"
+            data-close="individual"
+            aria-label="Cerrar"
+          >
+            ×
+          </button>
+        </div>
+        <p id="individual-name" class="muted"></p>
+        <input type="hidden" name="publicacion_id" />
+        <label
+          >Fecha y hora · Honduras<input
+            name="fecha"
+            type="datetime-local"
+            required
+        /></label>
+        <p class="muted">
+          Elegí al menos 20 minutos de anticipación. Después podrás revisar y
+          confirmar.
+        </p>
+        <p class="form-error" role="alert"></p>
+        <div class="dialog-actions">
+          <span>Programación individual</span
+          ><button type="submit" class="button primary">
+            Revisar publicación
+          </button>
+        </div>
+      </form>
+    </dialog>
+
+    <dialog id="preview" class="wide-dialog">
+      <div class="dialog-heading">
+        <div>
+          <p class="eyebrow">REVISÁ TU PLAN</p>
+          <h2 id="preview-title">Vista previa del lote</h2>
+        </div>
+        <button
+          type="button"
+          class="icon-button close"
+          data-close="preview"
+          aria-label="Cerrar vista previa"
+        >
+          ×
+        </button>
+      </div>
+      <p class="muted">
+        El borrador queda guardado en la agenda. Confirmalo para activar los
+        envíos o descartalo para liberar el contenido.
+      </p>
+      <div id="preview-posts" class="preview-posts"></div>
+      <p id="preview-error" class="form-error" role="alert"></p>
+      <div class="dialog-actions">
+        <button id="discard-plan" class="button secondary">
+          Descartar borrador</button
+        ><button id="confirm-plan" class="button primary">
+          Confirmar programación
+        </button>
+      </div>
+    </dialog>
+
+    <dialog id="category-dialog">
+      <form id="category-form">
+        <div class="dialog-heading">
+          <h2>Nueva categoría</h2>
+          <button
+            type="button"
+            class="icon-button close"
+            data-close="category-dialog"
+            aria-label="Cerrar"
+          >
+            ×
+          </button>
+        </div>
+        <label>Nombre<input name="nombre" maxlength="100" required /></label
+        ><label
+          >Categoría superior<select name="padre">
+            <option value="">Sin categoría superior</option>
+          </select></label
+        >
+        <label class="checkbox"
+          ><input name="automatica" type="checkbox" checked /><span
+            >Permitir programación por lotes</span
+          ></label
+        >
+        <p class="form-error" role="alert"></p>
+        <div class="dialog-actions">
+          <span>Podés agregar más tipos después.</span
+          ><button class="button primary" type="submit">Crear categoría</button>
+        </div>
+      </form>
+    </dialog>
+    <div id="toast" class="toast" role="status" aria-live="polite" hidden></div>
+  </body>
+</html>
